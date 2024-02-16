@@ -2,7 +2,7 @@
 import {Notice, Plugin, PluginSettingTab, Setting, TFile} from 'obsidian';
 import {
 	AnimeBasic,
-	auth as ShikimoriAuth,
+	auth as ShikimoriAuth, Character, CharacterBasic,
 	client as ShikimoriClient,
 	UserRateExtended,
 	UserRateStatus
@@ -28,7 +28,7 @@ const DEFAULT_SETTINGS: ObsidianShikimoriSettings = {
 	shikiUsername: '',
 }
 
-function createSafeFolderName(name: string): string {
+function filenameSanitize(name: string): string {
 	return name
 		.replace(/[*"^]/g, '') // Remove *, ", and ^ without replacement
 		.replace(/[\/\\|?]/g, '-') // Replace /, \, |, and ? with -
@@ -79,6 +79,12 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 			name: 'Refresh Access Token',
 			callback: () => this.refreshTokenIfNeeded(),
 		});
+
+		this.addCommand({
+			id: 'get-characters',
+			name: 'Get Characters',
+			callback: () => this.getCharactersForOpenedAnime(),
+		});
 	}
 
 	async formatAnimeRates(animeRates: any): Promise<string> {
@@ -92,16 +98,20 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 			let nextEpisodeDate = nextEpisodeNumber ? new Date(airingStartDate.getTime() + nextEpisodeNumber * oneWeek) : null;
 
 			let yamlParts = ['---'];
-            // System Info
+			// System Info
 			yamlParts.push(`shikimori_id: ${rate.anime.id}`);
+			yamlParts.push(`shikimori_type: anime`);
 			yamlParts.push(`shikimori_url: https://shikimori.me${rate.anime.url}`);
 			yamlParts.push(`mal_id: ${rate.anime.myanimelist_id}`);
 
 			// Aliases
 			let aliases = [];
 
+			// Add the default name
+			aliases.push(`"${rate.anime.name}"`);
+
 			// Add Russian name at the top if it exists
-			if (rate.anime.russian) aliases.push(`${rate.anime.russian}`);
+			if (rate.anime.russian) aliases.push(`"${rate.anime.russian}"`);
 
 			// Merge English, Synonyms, and Japanese names
 			let otherNames = [
@@ -159,7 +169,7 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 			finalString += `## Basic Information\n\n`;
 			finalString += `- ${rate.anime.aired_on} to ${airingEndDate ? rate.anime.released_on : "Present"}\n`;
 			// Genres using callouts for emphasis
-			finalString += `- **Genres:** ${rate.anime.genres.map(g => `[[${g.name}]]`).join(", ")}\n`;
+			finalString += `- **Genres:** ${rate.anime.genres.map((g: { name: any; }) => `[[${g.name}]]`).join(", ")}\n`;
 
 			// Highlight the rating
 			finalString += `- **Rating:** ==${rate.anime.rating}==\n`;
@@ -170,7 +180,7 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 
 			// Duration, Studio, Score, and Status sections
 			finalString += `- **Duration:** ${rate.anime.duration} minutes per episode; in total ${round(rate.anime.duration * rate.anime.episodes / 60)} hours\n`;
-			finalString += `- **Studio:** ${rate.anime.studios.map(s => `[[${s.name}]]`).join(", ")}\n`;
+			finalString += `- **Studio:** ${rate.anime.studios.map((s: { name: any; }) => `[[${s.name}]]`).join(", ")}\n`;
 			finalString += `- **User Score:** ==${rate.score}== / **Anime Score:** ==${rate.anime.score}==\n`;
 			finalString += `- **Status:** ${rate.status}\n`;
 			finalString += `- *[Shikimori URL](https://shikimori.me${rate.anime.url})*\n\n`;
@@ -234,24 +244,22 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 				for (let rate of animeRates) {
 					rate.anime = await this.fetchAnimeInfo(rate.anime.id);
 					const formattedAnimeData = await this.formatAnimeRates([rate]);
-					const safeFolderName = createSafeFolderName(rate.anime.name);
-					const folderPath = `${this.settings.animeFolder}/${status}/${safeFolderName}`;
+					const safeFolderName = filenameSanitize(rate.anime.name);
+					const folderPath = `${this.settings.animeFolder}/${safeFolderName}`;
 
 					if (!this.app.vault.getAbstractFileByPath(folderPath)) {
 						await this.app.vault.createFolder(folderPath);
 					}
 
-					const filePath = `${folderPath}/${safeFolderName}.md`;
+					const filePath = `${folderPath}/${safeFolderName} (anime).md`;
 					let file = this.app.vault.getAbstractFileByPath(filePath);
 					if (file instanceof TFile) {
 						await this.app.vault.modify(file, formattedAnimeData);
 					} else {
 						await this.app.vault.create(filePath, formattedAnimeData);
 					}
-
-					notify(this, `Synced ${status} Shikimori lists.`, 5000);
-
 				}
+				notify(this, `Synced ${status} Shikimori lists.`, 5000);
 			} catch (error) {
 				console.error(`Failed to sync ${status} Shikimori lists:`, error);
 				notify(this, `Failed to sync ${status} Shikimori lists.`, 5000);
@@ -271,6 +279,153 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 				await new Promise(r => setTimeout(r, 1000));
 			}
 		}
+	}
+
+	async fetchAnimeRoles(id: number) {
+		while (true) {
+			try {
+				return await this.shikimoriClient.animes.roles({id: id});
+			} catch (error) {
+				console.error("Failed to fetch anime roles:", error);
+				console.error("Retrying in 1 second...");
+				await new Promise(r => setTimeout(r, 1000));
+			}
+		}
+	}
+
+	async fetchCharacterInfo(id: number) {
+		while (true) {
+			try {
+				return await this.shikimoriClient.characters.byId({id: id});
+			} catch (error) {
+				console.error("Failed to fetch character info:", error);
+				console.error("Retrying in 1 second...");
+				await new Promise(r => setTimeout(r, 1000));
+			}
+		}
+	}
+
+	async fetchAnimeCharacters(id: number) {
+		// call fetchAnimeRoles and then fetch characters via map
+		const roles = await this.fetchAnimeRoles(id);
+		let char_basics = roles.map(role => role.character).filter(char => char !== null) as CharacterBasic[];
+		let char_full: Character[] = [];
+		// now we need to get the full character info
+		for (let char of char_basics) {
+			char_full.push(await this.fetchCharacterInfo(char.id));
+		}
+		return char_full;
+	}
+
+	async getOpenedFileAnimeID() {
+		let activeFile = this.app.workspace.getActiveFile();
+		if (activeFile === null) {
+			new Notice('No active file.');
+			return null;
+		}
+		// id is stored in the frontmatter
+		let metadata = this.app.metadataCache.getFileCache(activeFile);
+		if (metadata === null) {
+			new Notice('No metadata for the active file.');
+			return null;
+		}
+		let frontmatter = metadata.frontmatter;
+		if (frontmatter === undefined) {
+			new Notice('No frontmatter for the active file.');
+			return null;
+		}
+		let id: number = frontmatter.shikimori_id;
+		if (id === undefined) {
+			new Notice('No shikimori_id in the frontmatter.');
+			return null;
+		}
+		return {id: id, path: activeFile.path};
+	}
+
+	async formatCharacterInfo(char: Character) {
+		let yamlParts = ['---'];
+		yamlParts.push(`shikimori_id: ${char.id}`);
+		yamlParts.push(`shikimori_url: https://shikimori.me${char.url}`);
+		// generate aliases
+		let aliases = [];
+		aliases.push(`"${char.name}"`);
+		aliases.push(`"${char.name} (${char.animes[0].name})"`);
+		if (char.russian) aliases.push(`"${char.russian}"`);
+		if (char.russian) aliases.push(`"${char.russian} (${char.animes[0].russian})"`);
+		if (char.japanese) aliases.push(`"${char.japanese}"`);
+		if (char.altname) aliases.push(`"${char.altname}"`);
+
+		yamlParts.push(`aliases: [${aliases.join(', ')}]`);
+		yamlParts.push(`name: "${char.name}"`);
+		yamlParts.push(`russian_name: "${char.russian}"`);
+		yamlParts.push(`japanese_name: "${char.japanese}"`);
+		yamlParts.push(`altname: "${char.altname}"`);
+		yamlParts.push(`anime_ids: [${char.animes.map(a => a.id).join(', ')}]`);
+		yamlParts.push(`manga_ids: [${char.mangas.map(a => a.id).join(', ')}]`);
+		yamlParts.push('---\n');
+
+		let finalString = `# ${char.name}\n\n`;
+		finalString += `## Basic Information\n\n`;
+		finalString += `- **Japanese Name:** ${char.japanese}\n`;
+		finalString += `- **Russian Name:** ${char.russian}\n`;
+		finalString += `- **Altname:** ${char.altname}\n`;
+		finalString += `- **Shikimori URL:** [${char.url}](https://shikimori.me${char.url})\n`;
+		finalString += `![](https://shikimori.me${char.image.original})\n\n`;
+		finalString += `## Description\n\n${char.description_html}\n\n`;
+		finalString += `## Anime\n\n`;
+		finalString += char.animes.map(a => `- [[${a.name} (anime)|${a.name}]]`).join('\n');
+		finalString += `\n\n## Manga\n\n`;
+		finalString += char.mangas.map(a => `- [[${a.name} (manga)|${a.name}]]`).join('\n');
+		finalString += `\n`;
+		return yamlParts.join('\n') + finalString;
+	}
+
+	async getCharactersForOpenedAnime() {
+		let openedFileAnime = await this.getOpenedFileAnimeID();
+		if (openedFileAnime === null) {
+			return;
+		}
+		let id = openedFileAnime.id;
+		let path = openedFileAnime.path;
+
+		if (id === null) {
+			return;
+		}
+		console.log(id);
+
+
+		let characters = await this.fetchAnimeCharacters(id);
+		console.log(characters);
+
+		// let's save them.
+		// we need to create a folder for characters (if it doesn't exist)
+		let folderPath = `${this.settings.animeFolder}/${filenameSanitize(characters[0].animes[0].name)}/Characters`;
+		try {
+			if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+				await this.app.vault.createFolder(folderPath);
+			}
+		} catch (error) {
+			// let's try to create the folder at path
+			folderPath = `${path}/Characters`;
+			if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+				await this.app.vault.createFolder(folderPath);
+			}
+		}
+		// and then save each character as a separate file
+		for (let char of characters) {
+			let safeFileName = filenameSanitize(char.name);
+			// filepaths are based on the character name and the anime name. of animes and mangas we need to get the first one
+			let sanitizedAnime = filenameSanitize(char.animes[0].name);
+			let filePath = `${folderPath}/${safeFileName} (${sanitizedAnime}).md`;
+
+			let file = this.app.vault.getAbstractFileByPath(filePath);
+			if (file instanceof TFile) {
+				await this.app.vault.modify(file, await this.formatCharacterInfo(char));
+			} else {
+				await this.app.vault.create(filePath, await this.formatCharacterInfo(char));
+			}
+		}
+		new Notice('Characters saved.');
 	}
 
 	async getRelatedAnime(id: number) {
@@ -368,6 +523,7 @@ interface PersistentNotice {
 	notice: Notice;
 	message: string;
 }
+
 let persistentNotices: PersistentNotice[] = [];
 
 // Show notification and log message into console.
@@ -385,7 +541,7 @@ class ObsidianShikimoriSettingTab extends PluginSettingTab {
 	plugin: ObsidianShikimoriPlugin;
 
 	display() {
-		const { containerEl } = this;
+		const {containerEl} = this;
 		containerEl.empty();
 
 		containerEl.createEl('h2', {text: 'General Settings'});
