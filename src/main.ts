@@ -1,6 +1,6 @@
 // Import necessary modules from Obsidian and node-shikimori
-import {App, Notice, Plugin, PluginSettingTab, Setting, TFile} from 'obsidian';
-import {client as ShikimoriClient, auth as ShikimoriAuth, UserRateExtended, AnimeBasic} from 'node-shikimori';
+import {Notice, Plugin, PluginSettingTab, Setting, TFile} from 'obsidian';
+import {AnimeBasic, auth as ShikimoriAuth, client as ShikimoriClient, UserRateExtended} from 'node-shikimori';
 
 interface ObsidianShikimoriSettings {
 	clientId: string;
@@ -18,7 +18,7 @@ const DEFAULT_SETTINGS: ObsidianShikimoriSettings = {
 
 export default class ObsidianShikimoriPlugin extends Plugin {
 	settings: ObsidianShikimoriSettings;
-	shikimoriClient = ShikimoriClient({clientName: "Obsidian", maxCallsPerMinute: 120, maxCallsPerSecond: 10});
+	shikimoriClient = ShikimoriClient({clientName: "Obsidian", maxCallsPerMinute: 200, maxCallsPerSecond: 25});
 
 	async onload() {
 		await this.loadPluginSettings();
@@ -45,40 +45,55 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 		});
 	}
 
-	async formatAnimeRates(animeRates: Array<UserRateExtended<AnimeBasic>>) : Promise<string> {
+	async formatAnimeRates(animeRates: any): Promise<string> {
 		const formattedRates = await Promise.all(animeRates.map(async (rate) => {
-			let finalString = `## ${rate.anime.name}\n`;
+			let finalString = `# ${rate.anime.name}\n\n`;
 
-			// Russian Title (As Italic Subtitle)
+			// Adding English and Russian Titles
+			if (rate.anime.english && rate.anime.english.length > 0) {
+				finalString += `*${rate.anime.english[0]}*`;
+			}
 			if (rate.anime.russian) {
-				finalString += `*${rate.anime.russian}*\n\n`;
+				finalString += ` - *${rate.anime.russian}*\n\n`;
+			} else {
+				finalString += `\n\n`;
 			}
 
-			// Core Metadata Table
-			finalString += `
-| Metadata          | Value           |
-|-------------------|-----------------|
-| **Score**         | ${rate.score}   |
-| **Status**        | ${rate.status}  |
-| **Episodes**      | ${rate.episodes} |
-| **Rewatches**     | ${rate.rewatches} |
-    \n`;
+			// Basic Information
+			finalString += `## Basic Information\n\n`;
+			finalString += `- **Genres:** ${rate.anime.genres.map(g => "[["+g.name+"]]").join(", ")}\n`;
+			finalString += `- **Rating:** ${rate.anime.rating}\n`;
+			finalString += `- **Aired:** ${rate.anime.aired_on} to ${rate.anime.released_on}\n`;
+			finalString += `- **Episodes:** ${rate.anime.episodes}\n`;
+			finalString += `- **Duration:** ${rate.anime.duration} minutes per episode\n`;
+			finalString += `- **Studio:** [${rate.anime.studios.map(s => s.name).join(", ")}](https://shikimori.me/studios/${rate.anime.studios.map(s => s.id).join(", ")})\n`;
+			finalString += `- **Score:** ${rate.anime.score} (User score: ${rate.score} by ${rate.user.nickname})\n`;
+			finalString += `- **Status:** ${rate.status}\n`;
+			finalString += `- **[Shikimori URL](https://shikimori.me${rate.anime.url})**\n\n`;
+			finalString += `![](https://shikimori.me${rate.anime.image.original})\n\n`;
 
-			// User Comment (if available)
-			if (rate.text) {
-				finalString += `> ${rate.text}\n\n`;
+			// Description
+			finalString += `## Description\n\n${rate.anime.description}\n\n`;
+
+			// Ratings and Status Distribution (Optional Implementation for Mermaid Charts)
+
+			// Media Links
+			if (rate.anime.videos && rate.anime.videos.length > 0) {
+				finalString += `## Media Links\n\n`;
+				rate.anime.videos.forEach(video => {
+					finalString += `- [${video.name || "Video"}](${video.url})\n`;
+				});
+				finalString += `\n`;
 			}
 
-			// Additional Details
-			finalString += `
-* **Total Episodes:** ${rate.anime.episodes}
-* **Aired on:** ${rate.anime.aired_on}
-* **Public Score:** ${rate.anime.score}
-* **Shikimori URL:** [${rate.anime.name}](https://shikimori.me${rate.anime.url})
-    \n`;
-
-			// Image
-			finalString += `![${rate.anime.name}](https://shikimori.me${rate.anime.image.original})\n`;
+			// Screenshots
+			if (rate.anime.screenshots && rate.anime.screenshots.length > 0) {
+				finalString += `## Screenshots\n\n`;
+				rate.anime.screenshots.forEach(screenshot => {
+					finalString += `![](https://shikimori.me${screenshot.original})\n`;
+				});
+				finalString += `\n`;
+			}
 
 			return finalString;
 		}));
@@ -106,6 +121,37 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 			});
             // let's order them by user score
 			animeRates.sort((a, b) => b.score - a.score);
+
+			// now, let's get all information about the titles
+			/* animes(methods): {
+				byId: ((params) => Promise<Anime>);
+				externalLinks: ((params) => Promise<ExternalLink[]>);
+				franchise: ((params) => Promise<Franchise>);
+				list: ((params) => Promise<AnimeBasic[]>);
+				related: ((params) => Promise<AnimeRelation[]>);
+				roles: ((params) => Promise<Role[]>);
+				screenshots: ((params) => Promise<Screenshot[]>);
+				similar: ((params) => Promise<AnimeBasic[]>);
+				topics: ((params) => Promise<Topic<AnimeBasic>[]>);
+			}
+			*/
+			// we'll go through each anime and add the info to the animeRates array (.anime), there's ratelimit
+			// so we'll do it in a loop
+			for (let i = 0; i < animeRates.length; i++) {
+				try {
+					animeRates[i].anime = await this.shikimoriClient.animes.byId({id: animeRates[i].anime.id});
+					console.log(`Fetched info for ${animeRates[i].anime.name}`);
+				}
+				catch (error) {
+					console.error("Failed to fetch anime info:", error);
+					// we'll try again in a second
+					i--;
+					await new Promise(r => setTimeout(r, 900));
+				}
+				await new Promise(r => setTimeout(r, 100));
+			}
+
+			console.log(animeRates);
 
 			// let's try to save the data to a new file
 			let file = this.app.vault.getAbstractFileByPath('test.md');
