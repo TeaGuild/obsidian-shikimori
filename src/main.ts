@@ -1,12 +1,22 @@
 // Import necessary modules from Obsidian and node-shikimori
 import {Notice, Plugin, PluginSettingTab, Setting, TFile} from 'obsidian';
-import {AnimeBasic, auth as ShikimoriAuth, client as ShikimoriClient, UserRateExtended} from 'node-shikimori';
+import {
+	AnimeBasic,
+	auth as ShikimoriAuth,
+	client as ShikimoriClient,
+	UserRateExtended,
+	UserRateStatus
+} from 'node-shikimori';
+import {FolderSuggest} from "./ui";
+import {round} from "@popperjs/core/lib/utils/math";
 
 interface ObsidianShikimoriSettings {
 	clientId: string;
 	clientSecret: string;
 	accessToken: string;
 	refreshToken: string;
+	animeFolder: string;
+	shikiUsername: string;
 }
 
 const DEFAULT_SETTINGS: ObsidianShikimoriSettings = {
@@ -14,6 +24,15 @@ const DEFAULT_SETTINGS: ObsidianShikimoriSettings = {
 	clientSecret: '',
 	accessToken: '',
 	refreshToken: '',
+	animeFolder: 'Anime',
+	shikiUsername: '',
+}
+
+function createSafeFolderName(name: string): string {
+	return name
+		.replace(/[*"^]/g, '') // Remove *, ", and ^ without replacement
+		.replace(/[\/\\|?]/g, '-') // Replace /, \, |, and ? with -
+		.replace(/:/g, ' -'); // Replace : with ' -' for readability
 }
 
 export default class ObsidianShikimoriPlugin extends Plugin {
@@ -30,11 +49,22 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 
 		this.addSettingTab(new ObsidianShikimoriSettingTab(this.app, this));
 
-		// Add command to sync Shikimori lists
+		// Add command to sync all Shikimori lists
 		this.addCommand({
 			id: 'sync-shikimori-lists',
 			name: 'Sync Shikimori Lists',
 			callback: () => this.syncShikimoriLists(),
+		});
+
+		// Add command to sync specific Shikimori lists
+		this.addCommand({
+			id: 'sync-specific-list',
+			name: 'Sync Specific List',
+			callback: () => {
+				// TODO: Add a modal to select the list to sync
+				let statuses: UserRateStatus[] = ['watching'];
+				this.syncShikimoriLists(statuses);
+			},
 		});
 
 		// Add command to authenticate with Shikimori
@@ -43,129 +73,215 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 			name: 'Authenticate with Shikimori',
 			callback: () => this.redirectToAuthPage(),
 		});
+
+		this.addCommand({
+			id: 'refresh-access-token',
+			name: 'Refresh Access Token',
+			callback: () => this.refreshTokenIfNeeded(),
+		});
 	}
 
 	async formatAnimeRates(animeRates: any): Promise<string> {
+		const oneWeek = 7 * 24 * 60 * 60 * 1000;
+		// @ts-ignore
 		const formattedRates = await Promise.all(animeRates.map(async (rate) => {
+			let airingStartDate = new Date(rate.anime.aired_on);
+			let airingEndDate = rate.anime.released_on ? new Date(rate.anime.released_on) : null;
+			let episodesAired = rate.anime.episodes_aired || rate.anime.episodes;
+			let nextEpisodeNumber = rate.episodes + 1 > episodesAired ? null : rate.episodes + 1;
+			let nextEpisodeDate = nextEpisodeNumber ? new Date(airingStartDate.getTime() + nextEpisodeNumber * oneWeek) : null;
+
+			let yamlParts = ['---'];
+            // System Info
+			yamlParts.push(`shikimori_id: ${rate.anime.id}`);
+			yamlParts.push(`shikimori_url: https://shikimori.me${rate.anime.url}`);
+			yamlParts.push(`mal_id: ${rate.anime.myanimelist_id}`);
+
+			// Aliases
+			let aliases = [];
+
+			// Add Russian name at the top if it exists
+			if (rate.anime.russian) aliases.push(`${rate.anime.russian}`);
+
+			// Merge English, Synonyms, and Japanese names
+			let otherNames = [
+				...(rate.anime.english || []),
+				...(rate.anime.synonims || []),
+				...(rate.anime.japanese || [])
+			];
+
+			// Add other names to aliases list
+			otherNames.forEach(name => aliases.push(`"${name}"`));
+
+			yamlParts.push(`aliases: [${aliases.join(', ')}]`);
+
+			// Genres
+			// @ts-ignore
+			let genres = rate.anime.genres.map(g => `"${g.name}"`).join(', ');
+			yamlParts.push(`genres: [${genres}]`);
+
+			// Other properties
+			yamlParts.push(`rating: "${rate.anime.rating}"`);
+			yamlParts.push(`aired_on: "${rate.anime.aired_on}"`);
+			yamlParts.push(`released_on: "${rate.anime.released_on}"`);
+			yamlParts.push(`episodes: ${rate.anime.episodes}`);
+			yamlParts.push(`duration: ${rate.anime.duration}`);
+			// @ts-ignore
+			let studios = rate.anime.studios.map(s => `"${s.name}"`).join(', ');
+			yamlParts.push(`studio: [${studios}]`);
+			yamlParts.push(`score: ${rate.anime.score}`);
+			yamlParts.push(`status: "${rate.anime.status}"`);
+
+			// User Info
+			yamlParts.push(`user_score: ${rate.score}`);
+			yamlParts.push(`user_status: "${rate.status}"`);
+			yamlParts.push(`user_created: ${rate.created_at}`);
+			yamlParts.push(`user_updated: ${rate.updated_at}`);
+			yamlParts.push(`episodes_watched: ${rate.episodes}`);
+			yamlParts.push(`rewatches: ${rate.rewatches}`);
+			// Close the YAML frontmatter block
+			yamlParts.push('---\n');
+
+			// Combine all parts into the final YAML frontmatter string
+			let yamlFrontMatter = yamlParts.join('\n');
+
 			let finalString = `# ${rate.anime.name}\n\n`;
 
-			// Adding English and Russian Titles
+			// Adding English and Russian Titles as aliases
 			if (rate.anime.english && rate.anime.english.length > 0) {
-				finalString += `*${rate.anime.english[0]}*`;
+				finalString += `*${rate.anime.english[0]}*\n\n`;
 			}
 			if (rate.anime.russian) {
-				finalString += ` - *${rate.anime.russian}*\n\n`;
-			} else {
-				finalString += `\n\n`;
+				finalString += `*${rate.anime.russian}*\n\n`;
 			}
 
 			// Basic Information
 			finalString += `## Basic Information\n\n`;
-			finalString += `- **Genres:** ${rate.anime.genres.map(g => "[["+g.name+"]]").join(", ")}\n`;
-			finalString += `- **Rating:** ${rate.anime.rating}\n`;
-			finalString += `- **Aired:** ${rate.anime.aired_on} to ${rate.anime.released_on}\n`;
-			finalString += `- **Episodes:** ${rate.anime.episodes}\n`;
-			finalString += `- **Duration:** ${rate.anime.duration} minutes per episode\n`;
-			finalString += `- **Studio:** [${rate.anime.studios.map(s => s.name).join(", ")}](https://shikimori.me/studios/${rate.anime.studios.map(s => s.id).join(", ")})\n`;
-			finalString += `- **Score:** ${rate.anime.score} (User score: ${rate.score} by ${rate.user.nickname})\n`;
+			finalString += `- ${rate.anime.aired_on} to ${airingEndDate ? rate.anime.released_on : "Present"}\n`;
+			// Genres using callouts for emphasis
+			finalString += `- **Genres:** ${rate.anime.genres.map(g => `[[${g.name}]]`).join(", ")}\n`;
+
+			// Highlight the rating
+			finalString += `- **Rating:** ==${rate.anime.rating}==\n`;
+
+			// Episodes watched visualized with HTML progress tag
+			let episodesWatchedPercentage = Math.round((rate.episodes / rate.anime.episodes) * 100);
+			finalString += `- **Episodes:** <progress value="${rate.episodes}" max="${rate.anime.episodes}"></progress> (${episodesWatchedPercentage}% - ${rate.episodes}(${episodesAired}) / ${rate.anime.episodes}) <br>\n`;
+
+			// Duration, Studio, Score, and Status sections
+			finalString += `- **Duration:** ${rate.anime.duration} minutes per episode; in total ${round(rate.anime.duration * rate.anime.episodes / 60)} hours\n`;
+			finalString += `- **Studio:** ${rate.anime.studios.map(s => `[[${s.name}]]`).join(", ")}\n`;
+			finalString += `- **User Score:** ==${rate.score}== / **Anime Score:** ==${rate.anime.score}==\n`;
 			finalString += `- **Status:** ${rate.status}\n`;
-			finalString += `- **[Shikimori URL](https://shikimori.me${rate.anime.url})**\n\n`;
-			finalString += `![](https://shikimori.me${rate.anime.image.original})\n\n`;
+			finalString += `- *[Shikimori URL](https://shikimori.me${rate.anime.url})*\n\n`;
+			finalString += `![](https://shikimori.me/${rate.anime.image.original})\n\n`;
 
-			// Description
-			finalString += `## Description\n\n${rate.anime.description}\n\n`;
-
-			// Ratings and Status Distribution (Optional Implementation for Mermaid Charts)
+			// Description as a block reference
+			finalString += `## Description\n\n${rate.anime.description_html}\n\n`;
 
 			// Media Links
 			if (rate.anime.videos && rate.anime.videos.length > 0) {
 				finalString += `## Media Links\n\n`;
-				rate.anime.videos.forEach(video => {
-					finalString += `- [${video.name || "Video"}](${video.url})\n`;
+				rate.anime.videos.forEach((video: { url: string | string[]; name: any; }) => {
+					if (video.url.includes("youtube.com") || video.url.includes("youtu.be")) {
+						finalString += `![](${video.url})\n`;
+					} else {
+						finalString += `- [${video.name || "Video"}](${video.url})\n`;
+					}
 				});
-				finalString += `\n`;
 			}
 
 			// Screenshots
 			if (rate.anime.screenshots && rate.anime.screenshots.length > 0) {
 				finalString += `## Screenshots\n\n`;
+				// @ts-ignore
 				rate.anime.screenshots.forEach(screenshot => {
 					finalString += `![](https://shikimori.me${screenshot.original})\n`;
 				});
 				finalString += `\n`;
 			}
 
-			return finalString;
+			return yamlFrontMatter + finalString;
 		}));
 
-		return formattedRates.join('\n');
+		return formattedRates.join('\n\n---\n\n');
 	}
 
-	async syncShikimoriLists() {
+	async syncShikimoriLists(statuses: UserRateStatus[] = ['planned', 'watching', 'completed', 'rewatching', 'on_hold', 'dropped']) {
 		if (!this.settings.accessToken) {
 			console.error("Access token not set. Please authenticate first.");
 			return;
 		}
 
-		try {
-			// Example of fetching and processing anime rates
-			// @ts-ignore
-			let animeRates: Array<UserRateExtended<AnimeBasic>> = await this.shikimoriClient.users.animeRates(
-				{censored: false, id: "SolAstri", limit: 100, page: 0, status: "completed"}
-			);
-			// do not use console.log, use Notice instead
-			notify(this, `Fetched anime rates from Shikimori`, 5000);
-			console.log(animeRates); // animerates is an array of anime rates
-			animeRates.forEach((rate) => {
-				console.log(rate.anime.name);
-			});
-            // let's order them by user score
-			animeRates.sort((a, b) => b.score - a.score);
+		for (let status of statuses) {
+			notify(this, `Fetching ${status} anime rates from Shikimori...`, 5000);
 
-			// now, let's get all information about the titles
-			/* animes(methods): {
-				byId: ((params) => Promise<Anime>);
-				externalLinks: ((params) => Promise<ExternalLink[]>);
-				franchise: ((params) => Promise<Franchise>);
-				list: ((params) => Promise<AnimeBasic[]>);
-				related: ((params) => Promise<AnimeRelation[]>);
-				roles: ((params) => Promise<Role[]>);
-				screenshots: ((params) => Promise<Screenshot[]>);
-				similar: ((params) => Promise<AnimeBasic[]>);
-				topics: ((params) => Promise<Topic<AnimeBasic>[]>);
-			}
-			*/
-			// we'll go through each anime and add the info to the animeRates array (.anime), there's ratelimit
-			// so we'll do it in a loop
-			for (let i = 0; i < animeRates.length; i++) {
-				try {
-					animeRates[i].anime = await this.shikimoriClient.animes.byId({id: animeRates[i].anime.id});
-					console.log(`Fetched info for ${animeRates[i].anime.name}`);
-				}
-				catch (error) {
-					console.error("Failed to fetch anime info:", error);
-					// we'll try again in a second
-					i--;
-					await new Promise(r => setTimeout(r, 900));
-				}
-				await new Promise(r => setTimeout(r, 100));
-			}
+			try {
+				let animeRates: UserRateExtended<AnimeBasic>[] = [];
+				let page = 0;
+				let fetchedRates: UserRateExtended<AnimeBasic>[];
 
-			console.log(animeRates);
+				do {
+					// @ts-ignore
+					fetchedRates = await this.shikimoriClient.users.animeRates(
+						{censored: false, id: "SolAstri", limit: 100, page: page++, status: status as UserRateStatus},
+					);
+					animeRates.push(...fetchedRates);
+				} while (fetchedRates.length === 100);
 
-			// let's try to save the data to a new file
-			let file = this.app.vault.getAbstractFileByPath('test.md');
-			if (file instanceof TFile) {
-				await this.app.vault.modify(file, `# Anime rates\n\n${await this.formatAnimeRates(animeRates)}`);
-			} else {
-				// create a new file
-				file = await this.app.vault.create('test.md', `# Anime rates\n\n${await this.formatAnimeRates(animeRates)}`);
-				if (file instanceof TFile) {
-					await this.app.vault.modify(file, await this.formatAnimeRates(animeRates));
+				animeRates.sort((a, b) => b.score - a.score);
+
+				for (let rate of animeRates) {
+					rate.anime = await this.fetchAnimeInfo(rate.anime.id);
+					const formattedAnimeData = await this.formatAnimeRates([rate]);
+					const safeFolderName = createSafeFolderName(rate.anime.name);
+					const folderPath = `${this.settings.animeFolder}/${status}/${safeFolderName}`;
+
+					if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+						await this.app.vault.createFolder(folderPath);
+					}
+
+					const filePath = `${folderPath}/${safeFolderName}.md`;
+					let file = this.app.vault.getAbstractFileByPath(filePath);
+					if (file instanceof TFile) {
+						await this.app.vault.modify(file, formattedAnimeData);
+					} else {
+						await this.app.vault.create(filePath, formattedAnimeData);
+					}
+
+					notify(this, `Synced ${status} Shikimori lists.`, 5000);
+
 				}
+			} catch (error) {
+				console.error(`Failed to sync ${status} Shikimori lists:`, error);
+				notify(this, `Failed to sync ${status} Shikimori lists.`, 5000);
 			}
-		} catch (error) {
-			console.error("Failed to sync Shikimori lists:", error);
+		}
+	}
+
+	async fetchAnimeInfo(id: number) {
+		while (true) {
+			try {
+				const result = await this.shikimoriClient.animes.byId({id: id});
+				console.log(result);
+				return result;
+			} catch (error) {
+				console.error("Failed to fetch anime info:", error);
+				console.error("Retrying in 1 second...");
+				await new Promise(r => setTimeout(r, 1000));
+			}
+		}
+	}
+
+	async getRelatedAnime(id: number) {
+		while (true) {
+			try {
+				return await this.shikimoriClient.animes.related({id: id});
+			} catch (error) {
+				console.error("Failed to fetch related anime:", error);
+				console.error("Retrying in 1 second...");
+				await new Promise(r => setTimeout(r, 1000));
+			}
 		}
 	}
 
@@ -272,6 +388,22 @@ class ObsidianShikimoriSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
+		containerEl.createEl('h2', {text: 'General Settings'});
+		new Setting(containerEl)
+			.setName("Anime directory")
+			.setDesc("Anime notes would be placed here")
+			.addText(text => {
+				new FolderSuggest(this.app, text.inputEl);
+				text.setValue(this.plugin.settings.animeFolder)
+					.onChange(async value => {
+						this.plugin.settings.animeFolder = value;
+						await this.plugin.savePluginSettings();
+					})
+			});
+
+		containerEl.createEl('h2', {text: 'Shikimori Settings'});
+		containerEl.createEl('p', {text: 'Please provide your Shikimori client ID and client secret to authenticate with Shikimori.'});
+
 		new Setting(containerEl)
 			.setName('Client ID')
 			.setDesc('Your Shikimori client ID')
@@ -318,6 +450,38 @@ class ObsidianShikimoriSettingTab extends PluginSettingTab {
 						await this.plugin.exchangeCodeForToken(authorizationCode);
 					} else {
 						new Notice('Authorization code is empty.');
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Shikimori Username')
+			.setDesc('Enter your Shikimori username')
+			.addText(text => text
+				.setValue(this.plugin.settings.shikiUsername || '')
+				.setPlaceholder('Your Shikimori username')
+				.onChange(async (value) => {
+					this.plugin.settings.shikiUsername = value;
+					await this.plugin.savePluginSettings();
+				}))
+			// we can also get the current user via node-shikimori whoami
+			.addButton(button => button
+				.setButtonText('Get Username')
+				.onClick(async () => {
+					if (!this.plugin.settings.accessToken) {
+						new Notice('Access token is not set. Please authenticate first.');
+						return;
+					}
+					try {
+						const user = await this.plugin.shikimoriClient.users.whoami();
+						this.plugin.settings.shikiUsername = user.nickname;
+						await this.plugin.savePluginSettings();
+						new Notice(`Username set to ${user.nickname}`);
+						// and update the input field
+						// @ts-ignore
+						this.containerEl.querySelector('input[placeholder="Your Shikimori username"]').value = user.nickname;
+					} catch (error) {
+						new Notice('Failed to fetch username.');
+						console.error("Failed to fetch username:", error);
 					}
 				}));
 	}
