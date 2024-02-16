@@ -1,5 +1,5 @@
 // Import necessary modules from Obsidian and node-shikimori
-import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {App, Plugin, PluginSettingTab, Setting, TFile} from 'obsidian';
 import { client as ShikimoriClient, auth as ShikimoriAuth } from 'node-shikimori';
 
 interface ObsidianShikimoriSettings {
@@ -46,19 +46,37 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 
 		try {
 			// Example of fetching and processing anime rates
-			const animeRates = await this.shikimoriClient.users.animeRates({ user_id: 'me' });
+			const animeRates = await this.shikimoriClient.users.animeRates(
+				{censored: false, id: "SolAstri", limit: 100, page: 0, status: "completed"}
+			);
 			// Process animeRates here...
 		} catch (error) {
 			console.error("Failed to sync Shikimori lists:", error);
 		}
 	}
 	async loadPluginSettings() {
-		const data = await this.app.vault.read('.obsidian/plugins/obsidian-shikimori/settings.json').catch(() => '{}');
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, JSON.parse(data));
+		let settingsFile = this.app.vault.getAbstractFileByPath('.obsidian/plugins/obsidian-shikimori/settings.json');
+		// it returns null or a TAbstractFile
+		if (settingsFile) {
+			// this.app.vault.read() takes a TFile, not a TAbstractFile, so we need to cast it
+			this.settings = JSON.parse(await this.app.vault.read(settingsFile as TFile)) as ObsidianShikimoriSettings;
+		} else {
+			this.settings = DEFAULT_SETTINGS;
+		}
 	}
-
 	async savePluginSettings() {
-		await this.app.vault.write('.obsidian/plugins/obsidian-shikimori/settings.json', JSON.stringify(this.settings));
+		let file = this.app.vault.getAbstractFileByPath(
+			'.obsidian/plugins/obsidian-shikimori/settings.json'
+		);
+		if (file) {
+			await this.app.vault.modify(file as TFile, JSON.stringify(this.settings, null, 2));
+		} else {
+			// Create the settings file if it doesn't exist
+			await this.app.vault.create(
+				'.obsidian/plugins/obsidian-shikimori/settings.json',
+				JSON.stringify(this.settings, null, 2)
+			);
+		}
 	}
 
 	configureClient() {
