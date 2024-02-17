@@ -124,6 +124,10 @@ export default class ObsidianShikimoriPlugin extends Plugin {
 			otherNames.forEach(name => aliases.push(`"${name}"`));
 
 			yamlParts.push(`aliases: [${aliases.join(', ')}]`);
+			yamlParts.push(`name: "${rate.anime.name}"`);
+			yamlParts.push(`russian_name: "${rate.anime.russian}"`);
+			yamlParts.push(`english_name: "${rate.anime.english[0]}"`);
+			yamlParts.push(`japanese_name: "${rate.anime.japanese[0]}"`);
 
 			// Genres
 			// @ts-ignore
